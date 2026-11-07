@@ -1,5 +1,7 @@
 import os
+import json
 import requests
+from urllib.parse import parse_qs, urlencode
 from flask import Flask, request, Response
 
 app = Flask(__name__)
@@ -23,8 +25,14 @@ def normalize_token(tok):
 UPSTREAM_API_KEY = normalize_token(os.environ.get("UPSTREAM_API_KEY", ""))
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "https://api.telegram.org").rstrip("/")
 UPSTREAM_TIMEOUT = int(os.environ.get("UPSTREAM_TIMEOUT", "120"))
+AUTO_PARSE_MODE = os.environ.get("AUTO_PARSE_MODE", "HTML")
 
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+
+PARSE_MODE_METHODS = {
+    "sendPhoto",
+    "sendDocument",
+}
 
 
 def split_method(path):
@@ -43,6 +51,81 @@ def split_method(path):
     return path
 
 
+def _inject_form(body):
+    try:
+        params = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+    except Exception:
+        return body
+    if "parse_mode" in params:
+        return body
+    params["parse_mode"] = [AUTO_PARSE_MODE]
+    try:
+        return urlencode(params, doseq=True).encode("utf-8")
+    except Exception:
+        return body
+
+
+def _inject_json(body):
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return body
+    if not isinstance(data, dict):
+        return body
+    if "parse_mode" in data:
+        return body
+    data["parse_mode"] = AUTO_PARSE_MODE
+    try:
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return body
+
+
+def _inject_multipart(body, content_type):
+    if "boundary=" not in content_type:
+        return body
+    try:
+        boundary = content_type.split("boundary=", 1)[1].split(";", 1)[0].strip().strip('"')
+    except Exception:
+        return body
+    if not boundary:
+        return body
+
+    if b'name="parse_mode"' in body:
+        return body
+
+    bb = boundary.encode()
+    new_part = (
+        b"--" + bb + b"\r\n"
+        b'Content-Disposition: form-data; name="parse_mode"\r\n'
+        b"\r\n" + AUTO_PARSE_MODE.encode() + b"\r\n"
+    )
+    final = b"--" + bb + b"--"
+    idx = body.rfind(final)
+    if idx < 0:
+        return body
+    return body[:idx] + new_part + body[idx:]
+
+
+def inject_parse_mode(body, content_type, method):
+    if not AUTO_PARSE_MODE:
+        return body
+    if method not in PARSE_MODE_METHODS:
+        return body
+    if not body:
+        return body
+
+    ct = (content_type or "").lower()
+
+    if "application/x-www-form-urlencoded" in ct:
+        return _inject_form(body)
+    if "application/json" in ct:
+        return _inject_json(body)
+    if "multipart/form-data" in ct:
+        return _inject_multipart(body, content_type)
+    return body
+
+
 @app.route("/", methods=["GET", "HEAD"])
 def health():
     return Response("ok", status=200, mimetype="text/plain")
@@ -51,12 +134,11 @@ def health():
 @app.route("/__ping", methods=["GET"])
 def __ping():
     return {
-        "version": "v4-normalized",
+        "version": "v5-parse-mode",
         "target_template": f"{UPSTREAM_BASE}/bot<TOKEN>/<method>",
         "token_len": len(UPSTREAM_API_KEY),
-        "token_has_colon": ":" in UPSTREAM_API_KEY,
-        "token_first4": UPSTREAM_API_KEY[:4],
-        "token_last4": UPSTREAM_API_KEY[-4:] if UPSTREAM_API_KEY else "",
+        "auto_parse_mode": AUTO_PARSE_MODE,
+        "parse_mode_methods": sorted(PARSE_MODE_METHODS),
     }
 
 
@@ -76,20 +158,14 @@ def relay(path):
         return Response("ok", status=200, mimetype="text/plain")
 
     if not UPSTREAM_API_KEY:
-        print("[RELAY] UPSTREAM_API_KEY missing", flush=True)
         return Response("UPSTREAM_API_KEY not configured", status=500,
                         mimetype="text/plain")
 
     method = split_method(path)
     if not method:
-        print(f"[RELAY] bad path={path!r}", flush=True)
         return Response("bad path", status=400, mimetype="text/plain")
 
     target = f"{UPSTREAM_BASE}/bot{UPSTREAM_API_KEY}/{method}"
-
-    safe_target = target.replace(UPSTREAM_API_KEY, "<TOKEN>")
-    print(f"[RELAY] {request.method} path={path!r} method={method!r} target={safe_target}",
-          flush=True)
 
     headers = {}
     ct = request.headers.get("Content-Type")
@@ -97,6 +173,7 @@ def relay(path):
         headers["Content-Type"] = ct
 
     body = request.get_data(cache=False)
+    body = inject_parse_mode(body, ct, method)
 
     try:
         resp = requests.request(
@@ -108,16 +185,9 @@ def relay(path):
             allow_redirects=False,
         )
     except requests.Timeout:
-        print(f"[RELAY] upstream TIMEOUT after {UPSTREAM_TIMEOUT}s", flush=True)
         return Response("upstream timeout", status=504)
     except requests.RequestException as e:
-        print(f"[RELAY] upstream ERROR {e}", flush=True)
         return Response(f"upstream error: {e}", status=502)
-
-    snippet = ""
-    if resp.status_code >= 400:
-        snippet = resp.content[:300].decode("utf-8", "replace")
-        print(f"[RELAY] upstream -> HTTP {resp.status_code} body={snippet}", flush=True)
 
     return Response(
         resp.content,
